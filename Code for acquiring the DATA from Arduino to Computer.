@@ -1,0 +1,221 @@
+Code for acquiring the DATA from Arduino to Computer. 
+
+clear;
+clc;
+
+% Parameters
+serialPort = 'COM11'; % COM port of your Arduino
+baudRate = 115200;   % Must match the baud rate in the Arduino sketch
+bufferSize = 500;    % Number of data points to display in the plot
+samplingRate = 100;  % Assumed sampling rate of the data (Hz)
+
+% Initialize serial connection
+try
+    arduino = serialport(serialPort, baudRate);
+    configureTerminator(arduino, "LF"); % Ensure line feed termination
+    disp('Successfully connected to Arduino.');
+catch ME
+    disp('Error: Unable to connect to the Arduino.');
+    disp(ME.message);
+    return;
+end
+
+% Initialize data storage
+data = zeros(bufferSize, 1);
+time = (1:bufferSize)' / samplingRate; % Time axis for plotting in seconds
+
+% Create figure for real-time plotting
+fig = figure('Name', 'Real-Time Data Analysis and Audio Recorder', ...
+    'NumberTitle', 'off', 'CloseRequestFcn', @closeFigureCallback);
+
+% Initialize appData for audio recording
+appData.isAudioRecording = false; % Flag to track recording status
+appData.recorder = [];            % Placeholder for audiorecorder object
+appData.waveformAxes = [];        % Placeholder for waveform figure
+guidata(fig, appData);            % Attach appData to the figure      
+% GUI Elements for Filter Cutoff Frequencies
+uicontrol('Style', 'text', 'String', 'High-Pass Cutoff:', 'Units', 'normalized', 'Position', [0.01, 0.95, 0.1, 0.03]);
+highPassInput = uicontrol('Style', 'edit', 'String', '10', 'Units', 'normalized', 'Position', [0.12, 0.95, 0.1, 0.03]);
+
+uicontrol('Style', 'text', 'String', 'Low-Pass Cutoff:', 'Units', 'normalized', 'Position', [0.01, 0.91, 0.1, 0.03]);
+lowPassInput = uicontrol('Style', 'edit', 'String', '40', 'Units', 'normalized', 'Position', [0.12, 0.91, 0.1, 0.03]);
+
+uicontrol('Style', 'text', 'String', 'Band-Pass Low Cutoff:', 'Units', 'normalized', 'Position', [0.25, 0.95, 0.15, 0.03]);
+bandPassLowInput = uicontrol('Style', 'edit', 'String', '10', 'Units', 'normalized', 'Position', [0.41, 0.95, 0.1, 0.03]);
+
+uicontrol('Style', 'text', 'String', 'Band-Pass High Cutoff:', 'Units', 'normalized', 'Position', [0.25, 0.91, 0.15, 0.03]);
+bandPassHighInput = uicontrol('Style', 'edit', 'String', '40', 'Units', 'normalized', 'Position', [0.41, 0.91, 0.1, 0.03]);
+   % Buttons for Audio Controls
+uicontrol('Style', 'pushbutton', 'String', 'Start Recording', ...
+    'Units', 'normalized', 'Position', [0.01, 0.85, 0.2, 0.05], ...
+    'Callback', @startRecording);
+
+uicontrol('Style', 'pushbutton', 'String', 'Stop Recording', ...
+    'Units', 'normalized', 'Position', [0.01, 0.78, 0.2, 0.05], ...
+    'Callback', @stopRecording);
+
+uicontrol('Style', 'pushbutton', 'String', 'Save Recording', ...
+    'Units', 'normalized', 'Position', [0.01, 0.71, 0.2, 0.05], ...
+    'Callback', @saveRecording);
+
+uicontrol('Style', 'pushbutton', 'String', 'Play Recording', ...
+    'Units', 'normalized', 'Position', [0.01, 0.64, 0.2, 0.05], ...
+    'Callback', @playRecording);
+% Plot Setup
+subplot(5, 1, 1); plotHandle = plot(time, data); grid on; title('Real-Time Data');
+subplot(5, 1, 2); fftHandle = plot((0:(bufferSize/2)-1) * (samplingRate / bufferSize), zeros(bufferSize/2, 1)); grid on; title('FFT of Data');
+subplot(5, 1, 3); highPassHandle = plot(time, zeros(bufferSize, 1)); grid on; title('High-Pass Filtered Data');
+subplot(5, 1, 4); lowPassHandle = plot(time, zeros(bufferSize, 1)); grid on; title('Low-Pass Filtered Data');
+subplot(5, 1, 5); bandPassHandle = plot(time, zeros(bufferSize, 1)); grid on; title('Band-Pass Filtered Data');
+
+% Heartbeat and Respiration Text
+heartbeatText = uicontrol('Style', 'text', 'String', 'Heartbeat: 0 BPM', ...
+    'Units', 'normalized', 'Position', [0.6, 0.95, 0.3, 0.03], 'FontSize', 10);
+respirationText = uicontrol('Style', 'text', 'String', 'Respiration: 0 breaths/min', ...
+    'Units', 'normalized', 'Position', [0.6, 0.91, 0.3, 0.03], 'FontSize', 10);
+
+% Processing Loop
+try
+    tickCount = 0;
+    while ishandle(fig)
+        tickCount = tickCount + 1;
+
+        % Update Filters Every 20 Iterations
+        if mod(tickCount, 20) == 0
+            highPassCutoff = str2double(get(highPassInput, 'String'));
+            lowPassCutoff = str2double(get(lowPassInput, 'String'));
+            bandPassCutoffLow = str2double(get(bandPassLowInput, 'String'));
+            bandPassCutoffHigh = str2double(get(bandPassHighInput, 'String'));
+
+            highPassFilter = designfilt('highpassiir', 'FilterOrder', 8, 'HalfPowerFrequency', highPassCutoff, 'SampleRate', samplingRate);
+            lowPassFilter = designfilt('lowpassiir', 'FilterOrder', 8, 'HalfPowerFrequency', lowPassCutoff, 'SampleRate', samplingRate);
+            bandPassFilter = designfilt('bandpassiir', 'FilterOrder', 8, ...
+                'HalfPowerFrequency1', bandPassCutoffLow, 'HalfPowerFrequency2', bandPassCutoffHigh, 'SampleRate', samplingRate);
+        end
+
+        % Read Data in Buffered Chunks
+        if arduino.NumBytesAvailable > 0
+            rawData = read(arduino, arduino.NumBytesAvailable, 'string');
+            values = str2double(splitlines(rawData));
+
+            for value = values'
+                if isnan(value), continue; end
+
+                % Shift Data and Append New Value
+                data(1:end-1) = data(2:end);
+                data(end) = value;
+
+                % Apply Filters
+                highPassData = filtfilt(highPassFilter, data);
+                lowPassData = filtfilt(lowPassFilter, data);
+                bandPassData = filtfilt(bandPassFilter, data);
+
+                % Update FFT (every 10 iterations)
+                if mod(tickCount, 10) == 0
+                    fftData = abs(fft(data));
+                    fftData = fftData(1:bufferSize/2) / bufferSize;
+                    set(fftHandle, 'YData', fftData);
+                end
+
+                % Update GUI Plots (every 5 iterations)
+                if mod(tickCount, 5) == 0
+                    set(plotHandle, 'YData', data);
+                    set(highPassHandle, 'YData', highPassData);
+                    set(lowPassHandle, 'YData', lowPassData);
+                    set(bandPassHandle, 'YData', bandPassData);
+                    drawnow limitrate;
+                end
+
+                % Calculate and Update Rates Every Second
+                if mod(tickCount, samplingRate) == 0
+                    [pksHeartbeat, ~] = findpeaks(highPassData, 'MinPeakDistance', samplingRate / 2);
+                    heartbeatRate = length(pksHeartbeat) * 60 / (bufferSize / samplingRate);
+                    respirationRate = length(findpeaks(lowPassData, 'MinPeakDistance', samplingRate)) * 60 / (bufferSize / samplingRate);
+                    set(heartbeatText, 'String', sprintf('Heartbeat: %.1f BPM', heartbeatRate));
+                    set(respirationText, 'String', sprintf('Respiration: %.1f breaths/min', respirationRate));
+                end
+            end
+        end
+    end
+catch ME
+    disp('Error occurred or terminated by user.');
+    disp(ME.message);
+end
+
+% Close Figure Callback
+function closeFigureCallback(~, ~)
+    clear arduino;
+    disp('Connection closed.');
+    delete(gcf);
+end  
+% Audio Recording Functions
+function startRecording(src, ~)
+    appData = guidata(src);
+    if ~isfield(appData, 'isAudioRecording') || ~appData.isAudioRecording
+        appData.recorder = audiorecorder(44100, 16, 1); % Initialize the audiorecorder object
+        record(appData.recorder); % Start recording
+        appData.isAudioRecording = true; % Update the recording status
+        disp('Recording started...');
+    else
+        disp('Recording is already in progress.');
+    end
+    guidata(src, appData);
+end
+
+function stopRecording(src, ~)
+    appData = guidata(src);
+    if isfield(appData, 'isAudioRecording') && appData.isAudioRecording
+        stop(appData.recorder); % Stop the recording
+        appData.isAudioRecording = false; % Update the recording status
+        disp('Recording stopped.');
+    else
+        disp('No recording is in progress.');
+    end
+    guidata(src, appData);
+end
+
+function saveRecording(src, ~)
+    appData = guidata(src);
+    if isfield(appData, 'recorder') && ~isempty(appData.recorder) && ~appData.isAudioRecording
+        [fileName, pathName] = uiputfile('*.wav', 'Save Recording As');
+        if fileName ~= 0
+            audioData = getaudiodata(appData.recorder);
+            audiowrite(fullfile(pathName, fileName), audioData, 44100);
+            disp(['Recording saved as ', fullfile(pathName, fileName)]);
+        else
+            disp('Save operation canceled.');
+        end
+    else
+        disp('No recording available to save.');
+    end
+    guidata(src, appData);
+end
+
+function playRecording(src, ~)
+    appData = guidata(src); % Retrieve appData from the current figure
+    if isfield(appData, 'recorder') && ~isempty(appData.recorder) && ~appData.isAudioRecording
+        % Retrieve recorded audio data
+        audioData = getaudiodata(appData.recorder); 
+        
+        % Play the audio
+        sound(audioData, 44100);
+        disp('Playing the recording...');
+        
+        % Display the waveform in a new or existing figure
+        if isempty(appData.waveformAxes) || ~isvalid(appData.waveformAxes)
+            % Create a new figure for the waveform if it doesn't exist
+            appData.waveformAxes = figure('Name', 'Audio Waveform', 'NumberTitle', 'off');
+        else
+            figure(appData.waveformAxes); % Bring the existing figure to focus
+        end
+        t = (0:length(audioData)-1) / 44100; % Time axis for the audio data
+        plot(t, audioData);
+        title('Recorded Audio Waveform');
+        xlabel('Time (s)');
+        ylabel('Amplitude');
+        grid on;
+    else
+        disp('No audio recording available to play.');
+    end
+    guidata(src, appData); % Save updated appData
+end
